@@ -1,0 +1,21 @@
+{
+    "port": null,
+    "baudrate": 115200,
+    "port_description_keywords": [
+        "For Protocol",
+        "USB VCOM",
+        "USB Serial Device",
+        "Silicon Labs",
+        "CP210"
+    ],
+    "probe_timeout_seconds": 1.5,
+    "axis_invert": {
+        "lh": false,
+        "lv": false,
+        "rh": false,
+        "rv": false,
+        "camera": false
+    },
+    "camera_button_threshold": 32000,
+    "verbose": false
+}

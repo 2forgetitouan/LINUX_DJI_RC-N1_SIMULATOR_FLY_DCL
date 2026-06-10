@@ -1,30 +1,88 @@
-import argparse
+"""DJI RC-N1 -> XInput gamepad bridge.
+
+Originally based on IvanYaky/DJI_RC-N1_SIMULATOR_FLY_DCL. Rewritten so the
+COM port is auto-detected (handles the case where DJI Assistant 2 is running
+and the controller appears as a plain "USB Serial Device") and so settings
+live in config.json next to the executable.
+"""
+
+import json
+import os
 import struct
+import sys
 import time
 from threading import Thread
 
+import serial
 import serial.tools.list_ports
 import vgamepad as vg
 
-parser = argparse.ArgumentParser(description='DJI Mavic 3 RC231, RC-N1)')
-parser.add_argument('-p', '--port', help='RC Serial Port', default="COM9")
+APP_VERSION = "3.1.0"
 
-args = parser.parse_args()
-gamepad = vg.VX360Gamepad()
-camera = 0
+DEFAULT_CONFIG = {
+    "port": None,
+    "baudrate": 115200,
+    "port_description_keywords": [
+        "For Protocol",
+        "USB VCOM",
+        "USB Serial Device",
+        "Silicon Labs",
+        "CP210",
+    ],
+    "probe_timeout_seconds": 1.5,
+    "axis_invert": {
+        "lh": False,
+        "lv": False,
+        "rh": False,
+        "rv": False,
+        "camera": False,
+    },
+    "camera_button_threshold": 32000,
+    "verbose": False,
+}
 
-events = (
-    gamepad.left_trigger,
-    gamepad.left_joystick(-16384, 16384),
-    gamepad.right_joystick(-16384, 16384),
-    )
 
-gamepad.reset()
-time.sleep(1)
+def app_dir():
+    """Folder next to the .exe (PyInstaller) or the .py file."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
-def calc_checksum(packet, plength):
 
-    crc = [0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf,
+def load_config():
+    path = os.path.join(app_dir(), "config.json")
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(DEFAULT_CONFIG, fp, indent=4)
+        print(f"Created default config at {path}")
+        return dict(DEFAULT_CONFIG)
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            user_cfg = json.load(fp)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Failed to read {path}: {exc}. Using defaults.")
+        return dict(DEFAULT_CONFIG)
+    # Shallow-merge so missing keys fall back to defaults.
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(user_cfg)
+    for k, v in DEFAULT_CONFIG["axis_invert"].items():
+        cfg.setdefault("axis_invert", {}).setdefault(k, v)
+    return cfg
+
+
+CONFIG = load_config()
+VERBOSE = bool(CONFIG.get("verbose", False))
+
+
+def log(msg):
+    if VERBOSE:
+        print(msg)
+
+
+# -------- DUML protocol (unchanged from upstream) -------------------------
+
+CRC_TABLE = [
+    0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf,
     0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,
     0x1081, 0x0108, 0x3393, 0x221a, 0x56a5, 0x472c, 0x75b7, 0x643e,
     0x9cc9, 0x8d40, 0xbfdb, 0xae52, 0xdaed, 0xcb64, 0xf9ff, 0xe876,
@@ -55,201 +113,238 @@ def calc_checksum(packet, plength):
     0xe70e, 0xf687, 0xc41c, 0xd595, 0xa12a, 0xb0a3, 0x8238, 0x93b1,
     0x6b46, 0x7acf, 0x4854, 0x59dd, 0x2d62, 0x3ceb, 0x0e70, 0x1ff9,
     0xf78f, 0xe606, 0xd49d, 0xc514, 0xb1ab, 0xa022, 0x92b9, 0x8330,
-    0x7bc7, 0x6a4e, 0x58d5, 0x495c, 0x3de3, 0x2c6a, 0x1ef1, 0x0f78]
+    0x7bc7, 0x6a4e, 0x58d5, 0x495c, 0x3de3, 0x2c6a, 0x1ef1, 0x0f78,
+]
 
-    # Seeds
-    # v = 0x1012 #Naza M
-    # v = 0x1013 #Phantom 2
-    # v = 0x7000 #Naza M V2
-    v = 0x3692  #P3/P4/Mavic 
+HDR_CHKSUM_TABLE = [
+    0x00, 0x5E, 0xBC, 0xE2, 0x61, 0x3F, 0xDD, 0x83, 0xC2, 0x9C, 0x7E, 0x20, 0xA3, 0xFD, 0x1F, 0x41,
+    0x9D, 0xC3, 0x21, 0x7F, 0xFC, 0xA2, 0x40, 0x1E, 0x5F, 0x01, 0xE3, 0xBD, 0x3E, 0x60, 0x82, 0xDC,
+    0x23, 0x7D, 0x9F, 0xC1, 0x42, 0x1C, 0xFE, 0xA0, 0xE1, 0xBF, 0x5D, 0x03, 0x80, 0xDE, 0x3C, 0x62,
+    0xBE, 0xE0, 0x02, 0x5C, 0xDF, 0x81, 0x63, 0x3D, 0x7C, 0x22, 0xC0, 0x9E, 0x1D, 0x43, 0xA1, 0xFF,
+    0x46, 0x18, 0xFA, 0xA4, 0x27, 0x79, 0x9B, 0xC5, 0x84, 0xDA, 0x38, 0x66, 0xE5, 0xBB, 0x59, 0x07,
+    0xDB, 0x85, 0x67, 0x39, 0xBA, 0xE4, 0x06, 0x58, 0x19, 0x47, 0xA5, 0xFB, 0x78, 0x26, 0xC4, 0x9A,
+    0x65, 0x3B, 0xD9, 0x87, 0x04, 0x5A, 0xB8, 0xE6, 0xA7, 0xF9, 0x1B, 0x45, 0xC6, 0x98, 0x7A, 0x24,
+    0xF8, 0xA6, 0x44, 0x1A, 0x99, 0xC7, 0x25, 0x7B, 0x3A, 0x64, 0x86, 0xD8, 0x5B, 0x05, 0xE7, 0xB9,
+    0x8C, 0xD2, 0x30, 0x6E, 0xED, 0xB3, 0x51, 0x0F, 0x4E, 0x10, 0xF2, 0xAC, 0x2F, 0x71, 0x93, 0xCD,
+    0x11, 0x4F, 0xAD, 0xF3, 0x70, 0x2E, 0xCC, 0x92, 0xD3, 0x8D, 0x6F, 0x31, 0xB2, 0xEC, 0x0E, 0x50,
+    0xAF, 0xF1, 0x13, 0x4D, 0xCE, 0x90, 0x72, 0x2C, 0x6D, 0x33, 0xD1, 0x8F, 0x0C, 0x52, 0xB0, 0xEE,
+    0x32, 0x6C, 0x8E, 0xD0, 0x53, 0x0D, 0xEF, 0xB1, 0xF0, 0xAE, 0x4C, 0x12, 0x91, 0xCF, 0x2D, 0x73,
+    0xCA, 0x94, 0x76, 0x28, 0xAB, 0xF5, 0x17, 0x49, 0x08, 0x56, 0xB4, 0xEA, 0x69, 0x37, 0xD5, 0x8B,
+    0x57, 0x09, 0xEB, 0xB5, 0x36, 0x68, 0x8A, 0xD4, 0x95, 0xCB, 0x29, 0x77, 0xF4, 0xAA, 0x48, 0x16,
+    0xE9, 0xB7, 0x55, 0x0B, 0x88, 0xD6, 0x34, 0x6A, 0x2B, 0x75, 0x97, 0xC9, 0x4A, 0x14, 0xF6, 0xA8,
+    0x74, 0x2A, 0xC8, 0x96, 0x15, 0x4B, 0xA9, 0xF7, 0xB6, 0xE8, 0x0A, 0x54, 0xD7, 0x89, 0x6B, 0x35,
+]
 
-    for i in range(0, plength):
-        vv = v >> 8
-        v = vv ^ crc[((packet[i] ^ v) & 0xFF)]
+
+def calc_checksum(packet, plength):
+    v = 0x3692  # P3 / P4 / Mavic seed
+    for i in range(plength):
+        v = (v >> 8) ^ CRC_TABLE[(packet[i] ^ v) & 0xFF]
     return v
 
-def calc_pkt55_hdr_checksum(seed, packet, plength):
-    arr_2A103 = [0x00,0x5E,0xBC,0xE2,0x61,0x3F,0xDD,0x83,0xC2,0x9C,0x7E,0x20,0xA3,0xFD,0x1F,0x41,
-        0x9D,0xC3,0x21,0x7F,0xFC,0xA2,0x40,0x1E,0x5F,0x01,0xE3,0xBD,0x3E,0x60,0x82,0xDC,
-        0x23,0x7D,0x9F,0xC1,0x42,0x1C,0xFE,0xA0,0xE1,0xBF,0x5D,0x03,0x80,0xDE,0x3C,0x62,
-        0xBE,0xE0,0x02,0x5C,0xDF,0x81,0x63,0x3D,0x7C,0x22,0xC0,0x9E,0x1D,0x43,0xA1,0xFF,
-        0x46,0x18,0xFA,0xA4,0x27,0x79,0x9B,0xC5,0x84,0xDA,0x38,0x66,0xE5,0xBB,0x59,0x07,
-        0xDB,0x85,0x67,0x39,0xBA,0xE4,0x06,0x58,0x19,0x47,0xA5,0xFB,0x78,0x26,0xC4,0x9A,
-        0x65,0x3B,0xD9,0x87,0x04,0x5A,0xB8,0xE6,0xA7,0xF9,0x1B,0x45,0xC6,0x98,0x7A,0x24,
-        0xF8,0xA6,0x44,0x1A,0x99,0xC7,0x25,0x7B,0x3A,0x64,0x86,0xD8,0x5B,0x05,0xE7,0xB9,
-        0x8C,0xD2,0x30,0x6E,0xED,0xB3,0x51,0x0F,0x4E,0x10,0xF2,0xAC,0x2F,0x71,0x93,0xCD,
-        0x11,0x4F,0xAD,0xF3,0x70,0x2E,0xCC,0x92,0xD3,0x8D,0x6F,0x31,0xB2,0xEC,0x0E,0x50,
-        0xAF,0xF1,0x13,0x4D,0xCE,0x90,0x72,0x2C,0x6D,0x33,0xD1,0x8F,0x0C,0x52,0xB0,0xEE,
-        0x32,0x6C,0x8E,0xD0,0x53,0x0D,0xEF,0xB1,0xF0,0xAE,0x4C,0x12,0x91,0xCF,0x2D,0x73,
-        0xCA,0x94,0x76,0x28,0xAB,0xF5,0x17,0x49,0x08,0x56,0xB4,0xEA,0x69,0x37,0xD5,0x8B,
-        0x57,0x09,0xEB,0xB5,0x36,0x68,0x8A,0xD4,0x95,0xCB,0x29,0x77,0xF4,0xAA,0x48,0x16,
-        0xE9,0xB7,0x55,0x0B,0x88,0xD6,0x34,0x6A,0x2B,0x75,0x97,0xC9,0x4A,0x14,0xF6,0xA8,
-        0x74,0x2A,0xC8,0x96,0x15,0x4B,0xA9,0xF7,0xB6,0xE8,0x0A,0x54,0xD7,0x89,0x6B,0x35]
 
+def calc_pkt55_hdr_checksum(seed, packet, plength):
     chksum = seed
-    for i in range(0, plength):
-        chksum = arr_2A103[((packet[i] ^ chksum) & 0xFF)];
+    for i in range(plength):
+        chksum = HDR_CHKSUM_TABLE[(packet[i] ^ chksum) & 0xFF]
     return chksum
 
-def send_duml(s, source, target, cmd_type, cmd_set, cmd_id, payload = None):
-    global sequence_number
-    sequence_number = 0x34eb
-    packet = bytearray.fromhex(u'55')
-    length = 13
-    if payload is not None:
-        length = length + len(payload)
 
+SEQUENCE_NUMBER = 0x34eb
+
+
+def send_duml(s, source, target, cmd_type, cmd_set, cmd_id, payload=None):
+    global SEQUENCE_NUMBER
+    packet = bytearray.fromhex("55")
+    length = 13 + (len(payload) if payload is not None else 0)
     if length > 0x3ff:
-        print("Packet too large")
-        exit(1)
+        raise ValueError("DUML packet too large")
 
-    packet += struct.pack('B', length & 0xff)
-    packet += struct.pack('B', (length >> 8) | 0x4) # MSB of length and protocol version
-    hdr_crc = calc_pkt55_hdr_checksum(0x77, packet, 3)
-    packet += struct.pack('B', hdr_crc)
-    packet += struct.pack('B', source)
-    packet += struct.pack('B', target)
-    packet += struct.pack('<H', sequence_number)
-    packet += struct.pack('B', cmd_type)
-    packet += struct.pack('B', cmd_set)
-    packet += struct.pack('B', cmd_id)
-
+    packet += struct.pack("B", length & 0xff)
+    packet += struct.pack("B", (length >> 8) | 0x4)
+    packet += struct.pack("B", calc_pkt55_hdr_checksum(0x77, packet, 3))
+    packet += struct.pack("B", source)
+    packet += struct.pack("B", target)
+    packet += struct.pack("<H", SEQUENCE_NUMBER)
+    packet += struct.pack("B", cmd_type)
+    packet += struct.pack("B", cmd_set)
+    packet += struct.pack("B", cmd_id)
     if payload is not None:
         packet += payload
 
-    crc = calc_checksum(packet, len(packet))
-    packet += struct.pack('<H',crc)
+    packet += struct.pack("<H", calc_checksum(packet, len(packet)))
     s.write(packet)
-    #print(' '.join(format(x, '02x') for x in packet))
+    SEQUENCE_NUMBER = (SEQUENCE_NUMBER + 1) & 0xFFFF
 
-    sequence_number += 1
 
-print('app version: 3.0.0\n')
-# Open serial.
-try:
+# -------- Port discovery -------------------------------------------------
 
-    result = []
-    ports = serial.tools.list_ports.comports(True)
+def candidate_ports(cfg):
+    """Return the COM ports we should try, most-likely first."""
+    all_ports = list(serial.tools.list_ports.comports(True))
 
-    for port in ports:
-        try:
-            print(port.description)
-            if port.description.find("For Protocol") != -1:
-                print("found DJI USB VCOM For Protocol")
-                s = serial.Serial(port=port.name, baudrate=115200)
-                print('Opened serial port:', s.name)
-            else:
-                print("skip")
-            result.append(port)
-        except (OSError, serial.SerialException):
-            pass
+    forced = cfg.get("port")
+    if forced:
+        forced_match = [p for p in all_ports if p.name.upper() == forced.upper()]
+        if forced_match:
+            return forced_match
+        print(f"Configured port {forced} not present. Falling back to auto-detect.")
 
-except serial.SerialException as e:
-    print('Could not open serial port:', e)
-    exit(1)
+    keywords = [kw.lower() for kw in cfg.get("port_description_keywords", [])]
 
-# Stylistic: Newline for spacing.
-print('\nDji RC231 emulation started...\n')
-print('\nClose terminal to stop\n')
+    def score(port):
+        desc = (port.description or "").lower()
+        # Prefer the "For Protocol" interface when DJI Assistant 2 drivers expose it.
+        if "for protocol" in desc:
+            return 0
+        for idx, kw in enumerate(keywords):
+            if kw and kw in desc:
+                return idx + 1
+        return len(keywords) + 1
 
-print('*******************************************************\n')
-print('* Telegram: https://t.me/DJI_RC_N1_SIMULATOR_FLY_DC   *\n')
-print('* Donate: https://www.buymeacoffee.com/ivanyakymenko  *\n')
-print('*******************************************************\n')
+    matches = [p for p in all_ports if score(p) <= len(keywords)]
+    matches.sort(key=score)
 
-# Process input (min 364, center 1024, max 1684) -> (min 0, center 16384, max 32768)
-def parseInput(input, name):
-    output = (int.from_bytes(input, byteorder='little') - 1024) * 2 * 4096 // 165
-    if output >= 32768:
-        output = 32767
+    print("Available serial ports:")
+    for p in all_ports:
+        marker = "try" if p in matches else "skip"
+        print(f"  [{marker}] {p.name}  {p.description}")
+    return matches
 
-#    print(output, "test")
 
-    return output
+def probe_port(port_info, cfg):
+    """Open a port and verify a DUML response. Returns the open Serial or None."""
+    name = port_info.name
+    baud = int(cfg.get("baudrate", 115200))
+    timeout = float(cfg.get("probe_timeout_seconds", 1.5))
+    try:
+        s = serial.Serial(port=name, baudrate=baud, timeout=timeout)
+    except (OSError, serial.SerialException) as exc:
+        print(f"  {name}: cannot open ({exc})")
+        return None
 
-st = {"rh": 0, "rv": 0, "lh": 0, "lv": 0}
+    try:
+        # Enable simulator mode then poke for stick values.
+        send_duml(s, 0x0a, 0x06, 0x40, 0x06, 0x24, bytearray.fromhex("01"))
+        send_duml(s, 0x0a, 0x06, 0x40, 0x06, 0x01, bytearray.fromhex(""))
+    except (OSError, serial.SerialException) as exc:
+        print(f"  {name}: write failed ({exc})")
+        s.close()
+        return None
 
-def threaded_function():
-    while(True):
-        time.sleep(0.1)
-        #print("working ...")
-        gamepad.left_joystick(int(st["lh"]), int(st["lv"]))
-        gamepad.right_joystick(int(st["rh"]), int(st["rv"]))
-        if camera > 32000:
-            gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y) #restart race
-        if camera < -32000:
-            gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B) #recover drone
-        if camera == 0:
-            gamepad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
-            gamepad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
-        gamepad.update()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        b = s.read(1)
+        if b == b"\x55":
+            print(f"  {name}: DUML response received -> using this port")
+            # Restore a blocking timeout for the main loop.
+            s.timeout = None
+            return s
+    print(f"  {name}: no DUML response")
+    s.close()
+    return None
 
-thread = Thread(target = threaded_function, args = ())
-thread.start()
-#thread.join()
 
-try:
-    # enable simulator mode for RC (without this stick positions are sent very slow by RC)
-    send_duml(s, 0x0a, 0x06, 0x40, 0x06, 0x24, bytearray.fromhex('01'))
+def open_controller(cfg):
+    ports = candidate_ports(cfg)
+    if not ports:
+        print("No matching serial ports found. Plug in the controller (bottom USB-C "
+              "port) and make sure DJI Assistant 2 drivers are installed.")
+        return None
+    print("\nProbing candidate ports for DUML response...")
+    for p in ports:
+        s = probe_port(p, cfg)
+        if s is not None:
+            return s
+    print("\nNone of the candidate ports answered. If DJI Assistant 2 is open, close it "
+          "(it holds the protocol port) and try again.")
+    return None
 
-    while True:
 
-        #time.sleep(0.1)
-        # read channel values
-        send_duml(s, 0x0a, 0x06, 0x40, 0x06, 0x01, bytearray.fromhex(''))
-        #s.write(bytearray.fromhex('55 0d 04 33 0a 06 eb 34 40 06 01 74 24'))
-        # Don't write to a new line every time.
-#        print('\rPinged. ', end='')
+# -------- Gamepad loop ---------------------------------------------------
 
-        # read duml
-        buffer = bytearray.fromhex('')
+def parse_axis(raw_bytes, invert=False):
+    value = (int.from_bytes(raw_bytes, byteorder="little") - 1024) * 2 * 4096 // 165
+    if value >= 32768:
+        value = 32767
+    if value < -32768:
+        value = -32768
+    return -value if invert else value
+
+
+def run():
+    print(f"app version: {APP_VERSION}\n")
+    gamepad = vg.VX360Gamepad()
+    gamepad.reset()
+    time.sleep(1)
+
+    s = open_controller(CONFIG)
+    if s is None:
+        input("\nPress Enter to exit...")
+        return 1
+
+    print("\nDji RC231 emulation started.")
+    print("Close terminal to stop.\n")
+
+    state = {"lh": 0, "lv": 0, "rh": 0, "rv": 0, "camera": 0}
+    invert = CONFIG.get("axis_invert", {})
+    cam_threshold = int(CONFIG.get("camera_button_threshold", 32000))
+
+    def pump_gamepad():
         while True:
-            b = s.read(1)
-            if b == bytearray.fromhex('55'):
-                buffer.extend(b)
-                ph = s.read(2)
-                buffer.extend(ph)
-                ph = struct.unpack('<H', ph)[0]
-                pl = 0b0000001111111111 & ph
-                pv = 0b1111110000000000 & ph
-                pv = pv >> 10
-                pc = s.read(1)
-                buffer.extend(pc)
-                pd = s.read(pl - 4)
-                buffer.extend(pd)
-                break
+            time.sleep(0.1)
+            gamepad.left_joystick(int(state["lh"]), int(state["lv"]))
+            gamepad.right_joystick(int(state["rh"]), int(state["rv"]))
+            cam = state["camera"]
+            if cam > cam_threshold:
+                gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
+            elif cam < -cam_threshold:
+                gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
             else:
-                break
-        data = buffer
-#        print(' '.join(format(x, '02x') for x in data))
-#        time.sleep(0.5)
+                gamepad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
+                gamepad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
+            gamepad.update()
 
-        # Reverse-engineered. Controller input seems to always be len 38.
-        if len(data) == 38:
-            # Reverse-engineered
-            st["rh"] = parseInput(data[13:15], 'lv')
-            st["rv"] = parseInput(data[16:18], 'lh')
+    Thread(target=pump_gamepad, daemon=True).start()
 
-            st["lv"] = parseInput(data[19:21], 'rv')
-            st["lh"] = parseInput(data[22:24], 'rh')
+    try:
+        send_duml(s, 0x0a, 0x06, 0x40, 0x06, 0x24, bytearray.fromhex("01"))
+        while True:
+            send_duml(s, 0x0a, 0x06, 0x40, 0x06, 0x01, bytearray.fromhex(""))
 
-            camera = parseInput(data[25:27], 'cam')
+            buffer = bytearray()
+            b = s.read(1)
+            if b != b"\x55":
+                continue
+            buffer.extend(b)
+            ph = s.read(2)
+            buffer.extend(ph)
+            pl = 0x03FF & struct.unpack("<H", ph)[0]
+            buffer.extend(s.read(1))           # header checksum
+            buffer.extend(s.read(pl - 4))      # remainder
 
-            #print(data)
-            #with uinput.Device(events) as device:
-            #time.sleep(1)
-        #else:
-            # print(len(data))
+            data = buffer
+            if len(data) == 38:
+                state["rh"] = parse_axis(data[13:15], invert.get("rh", False))
+                state["rv"] = parse_axis(data[16:18], invert.get("rv", False))
+                state["lv"] = parse_axis(data[19:21], invert.get("lv", False))
+                state["lh"] = parse_axis(data[22:24], invert.get("lh", False))
+                state["camera"] = parse_axis(data[25:27], invert.get("camera", False))
+                log(f"L({state['lh']},{state['lv']}) R({state['rh']},{state['rv']}) "
+                    f"CAM={state['camera']}")
+    except serial.SerialException as exc:
+        print(f"\nSerial error: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nDetected keyboard interrupt.")
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    print("Stopping.")
+    return 0
 
-            # Log to console.
-            #print('L: H{0:06d},V{1:06d}; R: H{2:06d},V{3:06d}, CAM: {4:06d}\n'.format(left_horizontal, left_vertical, right_horizontal, right_vertical, camera), end='')
-except serial.SerialException as e:
-    # Stylistic: Newline to stop data update and spacing.
-    print('\n\nCould not read/write:', e)
-except KeyboardInterrupt:
-    # Stylistic: Newline to stop data update and spacing.
-    print('\n\nDetected keyboard interrupt.')
 
-    pass
-
-print('Stopping.')
+if __name__ == "__main__":
+    sys.exit(run())
