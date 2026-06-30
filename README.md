@@ -1,34 +1,37 @@
-# DJI RC-N1 → XInput Bridge (3.1.0)
+# DJI RC-N1 → Virtual Gamepad Bridge (Linux/Wayland) (3.1.0-linux)
 
-Makes a DJI RC-N1 / Mavic-style remote show up to Windows as a standard Xbox 360 gamepad, so you can use it in Liftoff, DCL, Velocidrone, etc.
+Makes a DJI RC-N1 / Mavic-style remote show up to Linux as a standard Xbox 360-style gamepad, so you can use it in Liftoff, DCL, Velocidrone, etc.
 
-Forked from [IvanYaky/DJI_RC-N1_SIMULATOR_FLY_DCL](https://github.com/IvanYaky/DJI_RC-N1_SIMULATOR_FLY_DCL) with three changes:
+Forked from [MaSsTerKidd0/DJI_RC-N1_SIMULATOR_FLY_DCL](https://github.com/MaSsTerKidd0/DJI_RC-N1_SIMULATOR_FLY_DCL), itself forked from [IvanYaky/DJI_RC-N1_SIMULATOR_FLY_DCL](https://github.com/IvanYaky/DJI_RC-N1_SIMULATOR_FLY_DCL), with one major change on top of MaSsTerKidd0's improvements:
 
-1. **Auto-detects the COM port** by probing for a real DUML response, so it doesn't matter whether the controller shows up as `Device USB VCOM For Protocol` or just `USB Serial Device`.
-2. **`config.json`** for port, baudrate, axis invert, etc. — no more editing the source.
-3. **Single-file `.exe`** built with PyInstaller. No Python install required for end users.
+1. **vgamepad/ViGEmBus replaced with evdev + `/dev/uinput`** the virtual gamepad is now created natively at the kernel level. Works identically under X11 and Wayland, since uinput sits below the display server entirely.
+2. **Serial port auto-detection adapted for Linux** (`/dev/ttyACM*`, `/dev/ttyUSB*`), with the same DUML-response probing logic and `config.json` settings as upstream.
+3. **`setup_and_run.sh`** one script that creates a virtual environment, installs missing dependencies, checks and fixes the permissions required for serial and uinput access, and launches the bridge.
 
 ---
 
-## Quick start (using the .exe)
+## Quick start
 
-1. Install **ViGEmBus** (one-time, signed driver): https://github.com/ViGEm/ViGEmBus/releases — grab the latest `ViGEmBus_*_x64.msi`, double-click, next-next-finish.
-2. Install **DJI Assistant 2** (needed only so Windows has the DJI USB driver). After install you can leave it closed — in fact, **close it before running this tool**, because it holds the serial port.
+1. Clone or unzip this folder anywhere.
+2. Make the setup script executable and run it:
+   ```bash
+   chmod +x setup_and_run.sh
+   ./setup_and_run.sh
+   ```
+   On first run it will create a `.venv`, install `pyserial` and `evdev`, and check whether your user has access to the serial port and to `/dev/uinput`. If it needs to add you to the `dialout` or `input` groups, it will ask you to reboot once — that's normal, group membership only takes effect on a new session.
 3. Plug your RC-N1 into the PC with a **data** USB-C cable, using the **bottom** USB-C port on the remote.
-4. Unzip this folder anywhere. Double-click **`dji_rcn1_bridge.exe`**.
-5. You should see something like:
+4. Run `./setup_and_run.sh` again. Once permissions are in order, it activates the virtual environment and launches the bridge directly. You should see something like:
    ```
    Available serial ports:
-     [try]  COM3  USB Serial Device
-     [try]  COM9  USB Serial Device
-   Probing candidate ports for DUML response...
-     COM3: cannot open (...)
-     COM9: DUML response received -> using this port
+     [match]  /dev/ttyACM0  C5 - V1 ACM Ctrl  (DJI)
+     [skip]   /dev/ttyACM1  C5 - Log ACM Ctrl  (DJI)
+   Probing candidate ports for a DUML response...
+     /dev/ttyACM0: DUML response received, using this port
 
-   Dji RC231 emulation started.
-   Close terminal to stop.
+   DJI RC231 emulation started.
+   Close the terminal (or press Ctrl+C) to stop.
    ```
-6. Launch your simulator. It should pick up an Xbox 360 controller.
+5. Launch your simulator. It should pick up a standard gamepad.
 
 Leave the terminal window open while you play — closing it stops the bridge.
 
@@ -36,18 +39,20 @@ Leave the terminal window open while you play — closing it stops the bridge.
 
 ## `config.json`
 
-Sits next to the `.exe`. Created automatically on first run if missing. All fields are optional.
+Sits next to `main.py`. Created automatically on first run if missing. All fields are optional.
 
 ```json
 {
     "port": null,
     "baudrate": 115200,
     "port_description_keywords": [
-        "For Protocol",
-        "USB VCOM",
-        "USB Serial Device",
-        "Silicon Labs",
-        "CP210"
+        "V1 ACM Ctrl",
+        "DJI",
+        "C5"
+    ],
+    "linux_port_glob_patterns": [
+        "/dev/ttyACM*",
+        "/dev/ttyUSB*"
     ],
     "probe_timeout_seconds": 1.5,
     "axis_invert": {
@@ -60,58 +65,63 @@ Sits next to the `.exe`. Created automatically on first run if missing. All fiel
     "camera_button_threshold": 32000,
     "verbose": false
 }
+
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `port` | Force a specific COM port, e.g. `"COM9"`. Leave `null` to auto-detect. |
+| `port` | Force a specific device, e.g. `"/dev/ttyACM0"`. Leave `null` to auto-detect. |
 | `baudrate` | Serial baud. Default 115200 — don't change unless you know why. |
-| `port_description_keywords` | Substrings to match against COM port descriptions. The auto-detector tries every matching port and uses the one that answers a DUML ping. |
+| `port_description_keywords` | Substrings to match against port descriptions/manufacturer. The auto-detector tries every matching port and uses the one that answers a DUML ping. |
+| `linux_port_glob_patterns` | Fallback used only if no port matches by description — tries these glob patterns directly. |
 | `probe_timeout_seconds` | How long to wait for each port to respond before giving up on it. |
 | `axis_invert.lh / lv / rh / rv / camera` | Flip an axis if your sim expects the opposite direction. |
-| `camera_button_threshold` | How far you have to spin the camera dial (±) before it presses Y / B. |
+| `camera_button_threshold` | How far you have to spin the camera dial (±) before it presses the mapped button. |
 | `verbose` | Log every stick frame to the terminal. Useful for debugging, noisy otherwise. |
 
-After editing the file, just restart the `.exe`.
+After editing the file, just restart the bridge.
 
 ---
 
 ## Troubleshooting
 
-**`None of the candidate ports answered.`**
-DJI Assistant 2 is probably running and holding the port. Close it from the system tray and re-run.
+**`UInputError: "/dev/uinput" cannot be opened for writing`**
+Permissions issue. Run `./setup_and_run.sh` — it sets up the required udev rule and group membership. If it just added you to a group, you need to reboot before it takes effect.
+
+**`No candidate port responded.`**
+Some other process is holding the serial port — typically DJI Assistant 2 running under Wine, if you use it. Close it and re-run.
 
 **No ports listed at all.**
 - Use a **data** USB-C cable (not charge-only).
 - Plug into the **bottom** USB-C port on the remote.
-- (Re)install DJI Assistant 2 — that ships the USB driver.
+- Check `dmesg` after plugging in — the `cdc_acm` kernel driver should pick up the device automatically; if it doesn't show up there, it's a cabling or kernel module issue, not a script issue.
 
 **Simulator doesn't see a controller.**
-Install ViGEmBus (link above). vgamepad uses it to emit the virtual Xbox 360 device.
+Make sure `setup_and_run.sh` completed without warnings (no pending reboot, `/dev/uinput` writable). The script exposes the device as soon as it starts; no separate driver install is needed on Linux.
 
 **Sticks centered but a bit off.**
-That's the controller's mechanical center. Recalibrate in Windows Game Controllers (`joy.cpl`) or in the sim's own bind UI.
+That's the controller's mechanical center. Recalibrate in your sim's own bind UI, or check with `evtest` / `jstest` against the created device.
 
 **One axis is reversed.**
-Flip the corresponding entry in `axis_invert` to `true`.
+Flip the corresponding entry in `axis_invert` to `true`. Note: vertical stick axes are already corrected internally for the XInput/evdev convention mismatch — `axis_invert` is only for actual hardware/wiring quirks.
 
 ---
 
 ## Building from source
 
-You don't need to do this if you have the `.exe`.
+You don't need to do this if you just want to run the bridge, `setup_and_run.sh` handles environment setup automatically.
 
-```powershell
-pip install -r requirements.txt
-python main.py            # run from source
-.\build.bat               # rebuild dji_rcn1_bridge.exe in dist\
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pyserial evdev
+python main.py
 ```
-
-`build.bat` runs PyInstaller with `--onefile --collect-all vgamepad` (vgamepad ships a bundled DLL that needs collecting).
 
 ---
 
 ## Credits
 
 - Original DUML protocol work and stick mapping: [@IvanYaky](https://github.com/IvanYaky)
-- vgamepad / ViGEmBus authors for the virtual Xbox 360 plumbing
+- COM port auto-detection, `config.json`, single-file packaging: [@MaSsTerKidd0](https://github.com/MaSsTerKidd0)
+- Linux/Wayland port (evdev/uinput, no Windows dependencies): this fork
