@@ -1,11 +1,13 @@
-"""DJI RC-N1 -> XInput gamepad bridge.
+"""DJI RC-N1 to virtual XInput-style gamepad bridge (Linux/Wayland).
+Originally based on MaSsTerKidd0/DJI_RC-N1_SIMULATOR_FLY_DCL.
+Linux port of the original Windows implementation, which relied on
+vgamepad/ViGEm (Windows-only). This version uses evdev and /dev/uinput
+to expose a kernel-level virtual joystick.
 
-Originally based on IvanYaky/DJI_RC-N1_SIMULATOR_FLY_DCL. Rewritten so the
-COM port is auto-detected (handles the case where DJI Assistant 2 is running
-and the controller appears as a plain "USB Serial Device") and so settings
-live in config.json next to the executable.
+Requires: pyserial, evdev.
 """
 
+import glob
 import json
 import os
 import struct
@@ -15,9 +17,15 @@ from threading import Thread
 
 import serial
 import serial.tools.list_ports
-import vgamepad as vg
 
-APP_VERSION = "3.1.0"
+try:
+    from evdev import UInput, AbsInfo, ecodes as e
+except ImportError:
+    print("Required module 'evdev' is not installed. Install it with:")
+    print("    pip install evdev")
+    sys.exit(1)
+
+APP_VERSION = "3.1.0-linux"
 
 DEFAULT_CONFIG = {
     "port": None,
@@ -28,6 +36,11 @@ DEFAULT_CONFIG = {
         "USB Serial Device",
         "Silicon Labs",
         "CP210",
+        "DJI",
+    ],
+    "linux_port_glob_patterns": [
+        "/dev/ttyACM*",
+        "/dev/ttyUSB*",
     ],
     "probe_timeout_seconds": 1.5,
     "axis_invert": {
@@ -43,7 +56,6 @@ DEFAULT_CONFIG = {
 
 
 def app_dir():
-    """Folder next to the .exe (PyInstaller) or the .py file."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
@@ -54,7 +66,7 @@ def load_config():
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as fp:
             json.dump(DEFAULT_CONFIG, fp, indent=4)
-        print(f"Created default config at {path}")
+        print(f"Default config created at {path}")
         return dict(DEFAULT_CONFIG)
     try:
         with open(path, "r", encoding="utf-8") as fp:
@@ -62,11 +74,11 @@ def load_config():
     except (OSError, json.JSONDecodeError) as exc:
         print(f"Failed to read {path}: {exc}. Using defaults.")
         return dict(DEFAULT_CONFIG)
-    # Shallow-merge so missing keys fall back to defaults.
     cfg = dict(DEFAULT_CONFIG)
     cfg.update(user_cfg)
     for k, v in DEFAULT_CONFIG["axis_invert"].items():
         cfg.setdefault("axis_invert", {}).setdefault(k, v)
+    cfg.setdefault("linux_port_glob_patterns", DEFAULT_CONFIG["linux_port_glob_patterns"])
     return cfg
 
 
@@ -79,7 +91,7 @@ def log(msg):
         print(msg)
 
 
-# -------- DUML protocol (unchanged from upstream) -------------------------
+# -------- DUML protocol -----------------------------------------------------
 
 CRC_TABLE = [
     0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf,
@@ -137,7 +149,7 @@ HDR_CHKSUM_TABLE = [
 
 
 def calc_checksum(packet, plength):
-    v = 0x3692  # P3 / P4 / Mavic seed
+    v = 0x3692
     for i in range(plength):
         v = (v >> 8) ^ CRC_TABLE[(packet[i] ^ v) & 0xFF]
     return v
@@ -177,28 +189,29 @@ def send_duml(s, source, target, cmd_type, cmd_set, cmd_id, payload=None):
     SEQUENCE_NUMBER = (SEQUENCE_NUMBER + 1) & 0xFFFF
 
 
-# -------- Port discovery -------------------------------------------------
+# -------- Serial port discovery ---------------------------------------------
 
 def candidate_ports(cfg):
-    """Return the COM ports we should try, most-likely first."""
     all_ports = list(serial.tools.list_ports.comports(True))
 
     forced = cfg.get("port")
     if forced:
-        forced_match = [p for p in all_ports if p.name.upper() == forced.upper()]
+        forced_match = [p for p in all_ports if p.name.upper() == forced.upper()
+                         or p.device.upper() == forced.upper()]
         if forced_match:
             return forced_match
-        print(f"Configured port {forced} not present. Falling back to auto-detect.")
+        print(f"Configured port {forced} not found. Falling back to auto-detection.")
 
     keywords = [kw.lower() for kw in cfg.get("port_description_keywords", [])]
 
     def score(port):
         desc = (port.description or "").lower()
-        # Prefer the "For Protocol" interface when DJI Assistant 2 drivers expose it.
-        if "for protocol" in desc:
+        manuf = (port.manufacturer or "").lower()
+        haystack = desc + " " + manuf
+        if "for protocol" in haystack:
             return 0
         for idx, kw in enumerate(keywords):
-            if kw and kw in desc:
+            if kw and kw in haystack:
                 return idx + 1
         return len(keywords) + 1
 
@@ -207,24 +220,40 @@ def candidate_ports(cfg):
 
     print("Available serial ports:")
     for p in all_ports:
-        marker = "try" if p in matches else "skip"
-        print(f"  [{marker}] {p.name}  {p.description}")
-    return matches
+        marker = "match" if p in matches else "skip"
+        print(f"  [{marker}] {p.device}  {p.description}  ({p.manufacturer or 'unknown'})")
+
+    if matches:
+        return matches
+
+    print("No description match found, falling back to /dev/ttyACM* and /dev/ttyUSB*...")
+    glob_candidates = []
+    for pattern in cfg.get("linux_port_glob_patterns", []):
+        glob_candidates.extend(sorted(glob.glob(pattern)))
+
+    class _FakePortInfo:
+        def __init__(self, device):
+            self.device = device
+            self.name = device
+            self.description = "(matched by glob pattern, no udev description)"
+
+    return [_FakePortInfo(dev) for dev in glob_candidates]
 
 
 def probe_port(port_info, cfg):
-    """Open a port and verify a DUML response. Returns the open Serial or None."""
-    name = port_info.name
+    name = getattr(port_info, "device", None) or port_info.name
     baud = int(cfg.get("baudrate", 115200))
     timeout = float(cfg.get("probe_timeout_seconds", 1.5))
     try:
         s = serial.Serial(port=name, baudrate=baud, timeout=timeout)
     except (OSError, serial.SerialException) as exc:
-        print(f"  {name}: cannot open ({exc})")
+        print(f"  {name}: could not open ({exc})")
+        if isinstance(exc, PermissionError) or "Permission denied" in str(exc):
+            print("    -> Permission issue. Make sure your user is a member of "
+                  "the 'dialout' group.")
         return None
 
     try:
-        # Enable simulator mode then poke for stick values.
         send_duml(s, 0x0a, 0x06, 0x40, 0x06, 0x24, bytearray.fromhex("01"))
         send_duml(s, 0x0a, 0x06, 0x40, 0x06, 0x01, bytearray.fromhex(""))
     except (OSError, serial.SerialException) as exc:
@@ -236,8 +265,7 @@ def probe_port(port_info, cfg):
     while time.time() < deadline:
         b = s.read(1)
         if b == b"\x55":
-            print(f"  {name}: DUML response received -> using this port")
-            # Restore a blocking timeout for the main loop.
+            print(f"  {name}: DUML response received, using this port")
             s.timeout = None
             return s
     print(f"  {name}: no DUML response")
@@ -248,20 +276,95 @@ def probe_port(port_info, cfg):
 def open_controller(cfg):
     ports = candidate_ports(cfg)
     if not ports:
-        print("No matching serial ports found. Plug in the controller (bottom USB-C "
-              "port) and make sure DJI Assistant 2 drivers are installed.")
+        print("No matching serial port found. Connect the controller and verify udev rules are in place.")
         return None
-    print("\nProbing candidate ports for DUML response...")
+    print("\nProbing candidate ports for a DUML response...")
     for p in ports:
         s = probe_port(p, cfg)
         if s is not None:
             return s
-    print("\nNone of the candidate ports answered. If DJI Assistant 2 is open, close it "
-          "(it holds the protocol port) and try again.")
+    print("\nNo candidate port responded. If DJI Assistant 2 is running, close "
+          "it first, as it holds the protocol port.")
     return None
 
 
-# -------- Gamepad loop ---------------------------------------------------
+# -------- Linux virtual gamepad (evdev / uinput) ----------------------------
+
+AXIS_MIN, AXIS_MAX = -32768, 32767
+
+GAMEPAD_CAPABILITIES = {
+    e.EV_KEY: [
+        e.BTN_SOUTH, e.BTN_EAST, e.BTN_NORTH, e.BTN_WEST,
+        e.BTN_TL, e.BTN_TR,
+        e.BTN_SELECT, e.BTN_START, e.BTN_MODE,
+        e.BTN_THUMBL, e.BTN_THUMBR,
+    ],
+    e.EV_ABS: [
+        (e.ABS_X, AbsInfo(value=0, min=AXIS_MIN, max=AXIS_MAX, fuzz=16, flat=128, resolution=0)),
+        (e.ABS_Y, AbsInfo(value=0, min=AXIS_MIN, max=AXIS_MAX, fuzz=16, flat=128, resolution=0)),
+        (e.ABS_RX, AbsInfo(value=0, min=AXIS_MIN, max=AXIS_MAX, fuzz=16, flat=128, resolution=0)),
+        (e.ABS_RY, AbsInfo(value=0, min=AXIS_MIN, max=AXIS_MAX, fuzz=16, flat=128, resolution=0)),
+    ],
+}
+
+
+class LinuxGamepad:
+    """Virtual Xbox360-style joystick backed by uinput.
+
+    Y axes are inverted on write: evdev's ABS_Y follows the kernel
+    convention (positive = down), opposite to the XInput convention used
+    upstream (positive = up) that the original vgamepad implementation
+    relied on. This keeps behavior consistent with the Windows version.
+    """
+
+    BUTTON_MAP = {
+        "camera_up": e.BTN_NORTH,
+        "camera_down": e.BTN_EAST,
+    }
+
+    def __init__(self):
+        try:
+            self.ui = UInput(GAMEPAD_CAPABILITIES,
+                              name="DJI RC-N1 Virtual Gamepad",
+                              vendor=0x045e, product=0x028e, version=1)
+        except PermissionError as exc:
+            print("\nCould not open /dev/uinput (permission denied).")
+            print("Check the udev rule and your membership in the 'input' "
+                  "group, then start a new session.")
+            raise SystemExit(1) from exc
+
+    def reset(self):
+        self.left_joystick(0, 0)
+        self.right_joystick(0, 0)
+        for code in self.BUTTON_MAP.values():
+            self.ui.write(e.EV_KEY, code, 0)
+        self.ui.syn()
+
+    def left_joystick(self, x, y):
+        self.ui.write(e.EV_ABS, e.ABS_X, int(x))
+        self.ui.write(e.EV_ABS, e.ABS_Y, int(-y))
+
+    def right_joystick(self, x, y):
+        self.ui.write(e.EV_ABS, e.ABS_RX, int(x))
+        self.ui.write(e.EV_ABS, e.ABS_RY, int(-y))
+
+    def press_button(self, name):
+        self.ui.write(e.EV_KEY, self.BUTTON_MAP[name], 1)
+
+    def release_button(self, name):
+        self.ui.write(e.EV_KEY, self.BUTTON_MAP[name], 0)
+
+    def update(self):
+        self.ui.syn()
+
+    def close(self):
+        try:
+            self.ui.close()
+        except Exception:
+            pass
+
+
+# -------- Main loop ----------------------------------------------------------
 
 def parse_axis(raw_bytes, invert=False):
     value = (int.from_bytes(raw_bytes, byteorder="little") - 1024) * 2 * 4096 // 165
@@ -274,7 +377,7 @@ def parse_axis(raw_bytes, invert=False):
 
 def run():
     print(f"app version: {APP_VERSION}\n")
-    gamepad = vg.VX360Gamepad()
+    gamepad = LinuxGamepad()
     gamepad.reset()
     time.sleep(1)
 
@@ -283,8 +386,8 @@ def run():
         input("\nPress Enter to exit...")
         return 1
 
-    print("\nDji RC231 emulation started.")
-    print("Close terminal to stop.\n")
+    print("\nDJI RC231 emulation started.")
+    print("Close the terminal (or press Ctrl+C) to stop.\n")
 
     state = {"lh": 0, "lv": 0, "rh": 0, "rv": 0, "camera": 0}
     invert = CONFIG.get("axis_invert", {})
@@ -293,16 +396,18 @@ def run():
     def pump_gamepad():
         while True:
             time.sleep(0.1)
-            gamepad.left_joystick(int(state["lh"]), int(state["lv"]))
-            gamepad.right_joystick(int(state["rh"]), int(state["rv"]))
+            gamepad.left_joystick(state["lh"], state["lv"])
+            gamepad.right_joystick(state["rh"], state["rv"])
             cam = state["camera"]
             if cam > cam_threshold:
-                gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
+                gamepad.press_button("camera_up")
+                gamepad.release_button("camera_down")
             elif cam < -cam_threshold:
-                gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
+                gamepad.press_button("camera_down")
+                gamepad.release_button("camera_up")
             else:
-                gamepad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
-                gamepad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
+                gamepad.release_button("camera_up")
+                gamepad.release_button("camera_down")
             gamepad.update()
 
     Thread(target=pump_gamepad, daemon=True).start()
@@ -320,8 +425,8 @@ def run():
             ph = s.read(2)
             buffer.extend(ph)
             pl = 0x03FF & struct.unpack("<H", ph)[0]
-            buffer.extend(s.read(1))           # header checksum
-            buffer.extend(s.read(pl - 4))      # remainder
+            buffer.extend(s.read(1))
+            buffer.extend(s.read(pl - 4))
 
             data = buffer
             if len(data) == 38:
@@ -336,13 +441,14 @@ def run():
         print(f"\nSerial error: {exc}")
         return 1
     except KeyboardInterrupt:
-        print("\nDetected keyboard interrupt.")
+        print("\nKeyboard interrupt received.")
     finally:
         try:
             s.close()
         except Exception:
             pass
-    print("Stopping.")
+        gamepad.close()
+    print("Stopped.")
     return 0
 
 
