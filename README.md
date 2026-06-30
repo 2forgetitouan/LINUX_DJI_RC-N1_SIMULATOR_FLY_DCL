@@ -1,4 +1,4 @@
-# DJI RC-N1 → Virtual Gamepad Bridge (Linux/Wayland) (3.1.0-linux)
+# DJI RC-N1 → Virtual Gamepad Bridge (Linux port) (3.1.0-linux)
 
 Makes a DJI RC-N1 / Mavic-style remote show up to Linux as a standard Xbox 360-style gamepad, so you can use it in Liftoff, DCL, Velocidrone, etc.
 
