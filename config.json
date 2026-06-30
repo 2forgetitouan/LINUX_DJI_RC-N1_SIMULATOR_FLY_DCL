@@ -2,11 +2,13 @@
     "port": null,
     "baudrate": 115200,
     "port_description_keywords": [
-        "For Protocol",
-        "USB VCOM",
-        "USB Serial Device",
-        "Silicon Labs",
-        "CP210"
+        "V1 ACM Ctrl",
+        "DJI",
+        "C5"
+    ],
+    "linux_port_glob_patterns": [
+        "/dev/ttyACM*",
+        "/dev/ttyUSB*"
     ],
     "probe_timeout_seconds": 1.5,
     "axis_invert": {
